@@ -36,7 +36,7 @@ async function connectToDatabase() {
 let rateLimit = {
   limit: 600,          // Default limit
   remaining: 600,      // Default remaining
-  reset: Date.now() + 60 * 60 * 1000, // Default reset time (1 hour from now)
+  reset: Date.now() + 60 * 1000, // Default reset time (1 minute from now)
 };
 
 // Helper function to wait for a specified number of milliseconds
@@ -44,54 +44,52 @@ function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Initialize Bottleneck limiter with default settings
+const limiter = new Bottleneck({
+  reservoir: rateLimit.remaining, // initial number of requests
+  reservoirRefreshAmount: rateLimit.limit,
+  reservoirRefreshInterval: 60 * 1000, // 1 minute
+  maxConcurrent: 10, // Increased concurrency
+  minTime: 100, // Decreased minimum time between requests to 100ms
+});
+
 // Function to update rate limit state based on response headers
 function updateRateLimit(headers) {
   const limit = parseInt(headers.get('X-Ratelimit-Limit'));
   const remaining = parseInt(headers.get('X-Ratelimit-Remaining'));
   const reset = parseInt(headers.get('X-Ratelimit-Reset')); // Assuming reset is in seconds
 
-  if (!isNaN(limit)) rateLimit.limit = limit;
-  if (!isNaN(remaining)) rateLimit.remaining = remaining;
+  let updated = false;
+
+  if (!isNaN(limit)) {
+    rateLimit.limit = limit;
+    updated = true;
+  }
+  if (!isNaN(remaining)) {
+    rateLimit.remaining = remaining;
+    updated = true;
+  }
   if (!isNaN(reset)) {
     rateLimit.reset = Date.now() + reset * 1000;
+    updated = true;
   }
 
-  console.log(`Rate Limit Updated: Limit=${rateLimit.limit}, Remaining=${rateLimit.remaining}, Reset in=${Math.ceil((rateLimit.reset - Date.now()) / 1000)} seconds`);
-}
-
-// Initialize Bottleneck limiter
-const limiter = new Bottleneck({
-  reservoir: rateLimit.remaining, // initial number of requests
-  reservoirRefreshAmount: rateLimit.limit,
-  reservoirRefreshInterval: 60 * 1000, // assume rate limit resets every minute; adjust as needed
-  maxConcurrent: 5, // adjust based on your needs
-  minTime: 200, // minimum time between requests in ms
-});
-
-// Function to handle rate limiting dynamically
-async function handleRateLimiting() {
-  const now = Date.now();
-  if (rateLimit.remaining <= 0) {
-    const waitTime = rateLimit.reset - now;
-    if (waitTime > 0) {
-      console.warn(`Rate limit exceeded. Waiting for ${Math.ceil(waitTime / 1000)} seconds.`);
-      await wait(waitTime);
-    }
-    // Reset the reservoir after waiting
+  if (updated) {
+    const refreshInterval = rateLimit.reset - Date.now();
     limiter.updateSettings({
-      reservoir: rateLimit.limit,
+      reservoir: rateLimit.remaining,
       reservoirRefreshAmount: rateLimit.limit,
-      reservoirRefreshInterval: 60 * 1000, // adjust based on actual reset time
+      reservoirRefreshInterval: refreshInterval > 0 ? refreshInterval : 60 * 1000, // Fallback to 1 minute
     });
+
+    console.log(`Rate Limit Updated: Limit=${rateLimit.limit}, Remaining=${rateLimit.remaining}, Reset in=${Math.ceil((rateLimit.reset - Date.now()) / 1000)} seconds`);
   }
 }
 
-// Modified fetchWithRetry to handle rate limiting using headers
+// Modified fetchWithRetry to handle rate limiting using headers and implement exponential backoff
 async function fetchWithRetry(url, retries = 3, delayMs = 1000) {
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
-      await handleRateLimiting();
-
       const response = await fetch(url);
 
       // Update rate limit state based on response headers
@@ -130,8 +128,9 @@ async function fetchWithRetry(url, retries = 3, delayMs = 1000) {
     } catch (error) {
       console.error(`Fetch attempt ${attempt + 1} failed:`, error);
       if (attempt < retries - 1) {
-        console.log(`Retrying in ${delayMs} ms...`);
-        await wait(delayMs);
+        const backoffTime = delayMs * Math.pow(2, attempt); // Exponential backoff
+        console.log(`Retrying in ${backoffTime} ms...`);
+        await wait(backoffTime);
       } else {
         throw error;
       }
@@ -139,7 +138,25 @@ async function fetchWithRetry(url, retries = 3, delayMs = 1000) {
   }
 }
 
-// Modify the GET function to be a regular async function
+// Function to handle rate limiting dynamically (if needed)
+async function handleRateLimiting() {
+  const now = Date.now();
+  if (rateLimit.remaining <= 0) {
+    const waitTime = rateLimit.reset - now;
+    if (waitTime > 0) {
+      console.warn(`Rate limit exceeded. Waiting for ${Math.ceil(waitTime / 1000)} seconds.`);
+      await wait(waitTime);
+    }
+    // Reset the reservoir after waiting
+    limiter.updateSettings({
+      reservoir: rateLimit.limit,
+      reservoirRefreshAmount: rateLimit.limit,
+      reservoirRefreshInterval: 60 * 1000, // 1 minute
+    });
+  }
+}
+
+// Function to fetch tokens with pagination, sorting, and field projection
 async function fetchTokens(request) {
   try {
     const { searchParams } = new URL(request.url);
@@ -241,7 +258,7 @@ async function fetchTokens(request) {
   }
 }
 
-// Modify the function for periodic updates to improve performance
+// Function for periodic updates to improve performance
 async function updatePricesAndMarketCaps() {
   const uniqueLabel = `Database update ${Date.now()}`;
   console.time(uniqueLabel);
@@ -326,7 +343,7 @@ module.exports = {
   fetchTokens,
 };
 
-// Modify the main function to include more detailed logging and prevent overlapping runs
+// Main function to include more detailed logging and prevent overlapping runs
 async function main() {
   try {
     // Ensure fetch is available before starting the update loop
@@ -345,7 +362,7 @@ async function main() {
       } catch (error) {
         console.error("Error during periodic update:", error);
       } finally {
-        // Schedule the next update immediately
+        // Schedule the next update immediately after the current one finishes
         setImmediate(scheduleNextUpdate);
       }
     };
