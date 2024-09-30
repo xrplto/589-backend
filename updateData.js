@@ -208,14 +208,26 @@ async function updatePricesAndMarketCaps() {
 async function fetchWithRetry(url, retries = 3, delay = 1000) {
   for (let i = 0; i < retries; i++) {
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, {
+        headers: {
+          'Accept': 'application/json'
+        }
+      });
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      // Check for rate limiting
+      const remainingRequests = response.headers.get('x-ratelimit-remaining');
+      if (remainingRequests && parseInt(remainingRequests) <= 1) {
+        const resetTime = response.headers.get('x-ratelimit-reset');
+        if (resetTime) {
+          await new Promise(resolve => setTimeout(resolve, parseInt(resetTime) * 1000));
+        }
       }
       return response;
     } catch (error) {
       if (i === retries - 1) throw error;
-      await new Promise(resolve => setTimeout(resolve, delay));
+      await new Promise(resolve => setTimeout(resolve, delay * (i + 1))); // Exponential backoff
     }
   }
 }
