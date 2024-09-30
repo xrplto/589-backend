@@ -3,7 +3,7 @@
 // Updates the prices and market caps of all tokens
 
 const { MongoClient, ObjectId } = require("mongodb");
-const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 const Bottleneck = require('bottleneck'); // Add Bottleneck for better rate limiting control
 
 // Use environment variables for sensitive data
@@ -243,75 +243,81 @@ async function fetchTokens(request) {
 
 // Modify the function for periodic updates to improve performance
 async function updatePricesAndMarketCaps() {
-  console.time('Database update');
-  const { db } = await connectToDatabase();
-  const collection = db.collection(COLLECTION_NAME);
+  const uniqueLabel = `Database update ${Date.now()}`;
+  console.time(uniqueLabel);
+  try {
+    const { db } = await connectToDatabase();
+    const collection = db.collection(COLLECTION_NAME);
 
-  const tokens = await collection.find({}, { projection: { issuer: 1, currencyCode: 1, totalSupply: 1, kingOfTheHill: 1 } }).toArray();
-  
-  console.log(`Starting update for ${tokens.length} tokens`);
+    const tokens = await collection.find({}, { projection: { issuer: 1, currencyCode: 1, totalSupply: 1, kingOfTheHill: 1 } }).toArray();
+    
+    console.log(`Starting update for ${tokens.length} tokens`);
 
-  const batchSize = 50; // Adjust this value based on your system's capabilities
-  const batches = Math.ceil(tokens.length / batchSize);
+    const batchSize = 50; // Adjust this value based on your system's capabilities
+    const batches = Math.ceil(tokens.length / batchSize);
 
-  for (let i = 0; i < batches; i++) {
-    const batchTokens = tokens.slice(i * batchSize, (i + 1) * batchSize);
-    const updatePromises = batchTokens.map(async (token) => {
-      if (token.issuer && token.currencyCode) {
-        const base = `${token.issuer}_${token.currencyCode}`;
-        const counter = "XRP";
-        const url = `https://data.xrplf.org/v1/iou/exchange_rates/${base}/${counter}`;
+    for (let i = 0; i < batches; i++) {
+      const batchTokens = tokens.slice(i * batchSize, (i + 1) * batchSize);
+      const updatePromises = batchTokens.map(async (token) => {
+        if (token.issuer && token.currencyCode) {
+          const base = `${token.issuer}_${token.currencyCode}`;
+          const counter = "XRP";
+          const url = `https://data.xrplf.org/v1/iou/exchange_rates/${base}/${counter}`;
 
-        try {
-          // Use the limiter to schedule requests
-          const response = await limiter.schedule(() => fetchWithRetry(url));
-          const data = await response.json();
-          const xrpPrice = data.rate;
+          try {
+            // Use the limiter to schedule requests
+            const response = await limiter.schedule(() => fetchWithRetry(url));
+            const data = await response.json();
+            const xrpPrice = data.rate;
 
-          if (xrpPrice && token.totalSupply) {
-            const marketCap = xrpPrice * token.totalSupply;
-            const lastUpdated = new Date();
+            if (xrpPrice && token.totalSupply) {
+              const marketCap = xrpPrice * token.totalSupply;
+              const lastUpdated = new Date();
 
-            const updateFields = {
-              marketCap,
-              lastUpdated,
-              xrpPrice,
-            };
+              const updateFields = {
+                marketCap,
+                lastUpdated,
+                xrpPrice,
+              };
 
-            if (marketCap >= 58900 && !token.kingOfTheHill) {
-              updateFields.kingOfTheHill = {
-                label: "King of the hill",
-                timestamp: new Date(),
+              if (marketCap >= 58900 && !token.kingOfTheHill) {
+                updateFields.kingOfTheHill = {
+                  label: "King of the hill",
+                  timestamp: new Date(),
+                };
+              }
+
+              return {
+                updateOne: {
+                  filter: { _id: token._id },
+                  update: { $set: updateFields },
+                },
               };
             }
-
-            return {
-              updateOne: {
-                filter: { _id: token._id },
-                update: { $set: updateFields },
-              },
-            };
+          } catch (error) {
+            console.error(`Error fetching price for token ${token._id}:`, error);
           }
-        } catch (error) {
-          console.error(`Error fetching price for token ${token._id}:`, error);
         }
+        return null;
+      });
+
+      const updates = (await Promise.all(updatePromises)).filter(Boolean);
+
+      if (updates.length > 0) {
+        await collection.bulkWrite(updates);
       }
-      return null;
-    });
 
-    const updates = (await Promise.all(updatePromises)).filter(Boolean);
-
-    if (updates.length > 0) {
-      await collection.bulkWrite(updates);
+      console.log(`Processed batch ${i + 1} of ${batches}`);
     }
 
-    console.log(`Processed batch ${i + 1} of ${batches}`);
+    console.log(
+      "Prices, market caps, last updated times, and 'King of the hill' status updated successfully"
+    );
+  } catch (error) {
+    console.error("Error during database update:", error);
+  } finally {
+    console.timeEnd(uniqueLabel);
   }
-
-  console.timeEnd('Database update');
-  console.log(
-    "Prices, market caps, last updated times, and 'King of the hill' status updated successfully"
-  );
 }
 
 // Export the functions
@@ -320,7 +326,7 @@ module.exports = {
   fetchTokens,
 };
 
-// Modify the main function to include more detailed logging
+// Modify the main function to include more detailed logging and prevent overlapping runs
 async function main() {
   try {
     // Ensure fetch is available before starting the update loop
@@ -330,18 +336,23 @@ async function main() {
     await updatePricesAndMarketCaps();
     console.log("Initial update completed successfully");
 
-    // Set up interval to run every 15 seconds
-    setInterval(async () => {
+    // Function to handle periodic updates without overlapping
+    const scheduleNextUpdate = async () => {
       try {
         console.log("Starting periodic update...");
         await updatePricesAndMarketCaps();
         console.log("Periodic update completed successfully");
       } catch (error) {
         console.error("Error during periodic update:", error);
+      } finally {
+        // Schedule the next update immediately
+        setImmediate(scheduleNextUpdate);
       }
-    }, 15000); // 15000 milliseconds = 15 seconds
+    };
 
-    console.log("Update loop started. Will run every 15 seconds.");
+    // Start the periodic update loop
+    scheduleNextUpdate();
+    console.log("Update loop started. Will run updates continuously without delay.");
   } catch (error) {
     console.error("Error during initial update:", error);
   }
