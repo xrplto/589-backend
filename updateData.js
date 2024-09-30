@@ -133,6 +133,59 @@ async function fetchTokens(request) {
 }
 
 // Modify the function for periodic updates to improve performance
+// Add a global rate limit tracker
+let requestsMade = 0;
+let rateLimitResetTime = Date.now() + 3600000; // 1 hour from now
+
+// Modify the fetchWithRetry function
+async function fetchWithRetry(url, retries = 3, delay = 1000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      // Check global rate limit
+      if (requestsMade >= 10000 && Date.now() < rateLimitResetTime) {
+        const waitTime = rateLimitResetTime - Date.now();
+        console.log(`Global rate limit reached. Waiting for ${waitTime}ms before next request.`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+        requestsMade = 0;
+        rateLimitResetTime = Date.now() + 3600000;
+      }
+
+      const response = await fetch(url, {
+        headers: {
+          'Accept': 'application/json'
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      // Update global rate limit tracker
+      requestsMade++;
+
+      // Handle rate limiting headers
+      const remainingRequests = parseInt(response.headers.get('x-ratelimit-remaining'));
+      const resetTime = parseInt(response.headers.get('x-ratelimit-reset'));
+
+      if (remainingRequests <= 1) {
+        console.log(`Rate limit nearly reached. Waiting for ${resetTime} seconds.`);
+        await new Promise(resolve => setTimeout(resolve, resetTime * 1000));
+      }
+
+      return response;
+    } catch (error) {
+      if (error.message.includes('429')) {
+        console.log(`Rate limit exceeded. Retrying after ${delay}ms.`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      if (i === retries - 1) throw error;
+      await new Promise(resolve => setTimeout(resolve, delay * (i + 1))); // Exponential backoff
+    }
+  }
+}
+
+// Modify the updatePricesAndMarketCaps function
 async function updatePricesAndMarketCaps() {
   console.time('Database update');
   const { db } = await connectToDatabase();
@@ -142,7 +195,7 @@ async function updatePricesAndMarketCaps() {
   
   console.log(`Starting update for ${tokens.length} tokens`);
 
-  const batchSize = 50; // Adjust this value based on your system's capabilities
+  const batchSize = 50;
   const batches = Math.ceil(tokens.length / batchSize);
 
   for (let i = 0; i < batches; i++) {
@@ -196,40 +249,15 @@ async function updatePricesAndMarketCaps() {
     }
 
     console.log(`Processed batch ${i + 1} of ${batches}`);
+
+    // Add a delay between batches to avoid hitting rate limits
+    if (i < batches - 1) {
+      await new Promise(resolve => setTimeout(resolve, 1000)); // 1 second delay
+    }
   }
 
   console.timeEnd('Database update');
-  console.log(
-    "Prices, market caps, last updated times, and 'King of the hill' status updated successfully"
-  );
-}
-
-// Add a new function for fetching with retry
-async function fetchWithRetry(url, retries = 3, delay = 1000) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      const response = await fetch(url, {
-        headers: {
-          'Accept': 'application/json'
-        }
-      });
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-      // Check for rate limiting
-      const remainingRequests = response.headers.get('x-ratelimit-remaining');
-      if (remainingRequests && parseInt(remainingRequests) <= 1) {
-        const resetTime = response.headers.get('x-ratelimit-reset');
-        if (resetTime) {
-          await new Promise(resolve => setTimeout(resolve, parseInt(resetTime) * 1000));
-        }
-      }
-      return response;
-    } catch (error) {
-      if (i === retries - 1) throw error;
-      await new Promise(resolve => setTimeout(resolve, delay * (i + 1))); // Exponential backoff
-    }
-  }
+  console.log("Prices, market caps, last updated times, and 'King of the hill' status updated successfully");
 }
 
 // Export the functions
