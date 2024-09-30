@@ -4,6 +4,7 @@
 
 const { MongoClient, ObjectId } = require("mongodb");
 const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+const Bottleneck = require('bottleneck'); // Add Bottleneck for better rate limiting control
 
 // Use environment variables for sensitive data
 const MONGODB_URI = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017";
@@ -29,6 +30,113 @@ async function connectToDatabase() {
   cachedDb = db;
 
   return { client, db };
+}
+
+// Rate Limiting State
+let rateLimit = {
+  limit: 600,          // Default limit
+  remaining: 600,      // Default remaining
+  reset: Date.now() + 60 * 60 * 1000, // Default reset time (1 hour from now)
+};
+
+// Helper function to wait for a specified number of milliseconds
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Function to update rate limit state based on response headers
+function updateRateLimit(headers) {
+  const limit = parseInt(headers.get('X-Ratelimit-Limit'));
+  const remaining = parseInt(headers.get('X-Ratelimit-Remaining'));
+  const reset = parseInt(headers.get('X-Ratelimit-Reset')); // Assuming reset is in seconds
+
+  if (!isNaN(limit)) rateLimit.limit = limit;
+  if (!isNaN(remaining)) rateLimit.remaining = remaining;
+  if (!isNaN(reset)) {
+    rateLimit.reset = Date.now() + reset * 1000;
+  }
+
+  console.log(`Rate Limit Updated: Limit=${rateLimit.limit}, Remaining=${rateLimit.remaining}, Reset in=${Math.ceil((rateLimit.reset - Date.now()) / 1000)} seconds`);
+}
+
+// Initialize Bottleneck limiter
+const limiter = new Bottleneck({
+  reservoir: rateLimit.remaining, // initial number of requests
+  reservoirRefreshAmount: rateLimit.limit,
+  reservoirRefreshInterval: 60 * 1000, // assume rate limit resets every minute; adjust as needed
+  maxConcurrent: 5, // adjust based on your needs
+  minTime: 200, // minimum time between requests in ms
+});
+
+// Function to handle rate limiting dynamically
+async function handleRateLimiting() {
+  const now = Date.now();
+  if (rateLimit.remaining <= 0) {
+    const waitTime = rateLimit.reset - now;
+    if (waitTime > 0) {
+      console.warn(`Rate limit exceeded. Waiting for ${Math.ceil(waitTime / 1000)} seconds.`);
+      await wait(waitTime);
+    }
+    // Reset the reservoir after waiting
+    limiter.updateSettings({
+      reservoir: rateLimit.limit,
+      reservoirRefreshAmount: rateLimit.limit,
+      reservoirRefreshInterval: 60 * 1000, // adjust based on actual reset time
+    });
+  }
+}
+
+// Modified fetchWithRetry to handle rate limiting using headers
+async function fetchWithRetry(url, retries = 3, delayMs = 1000) {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      await handleRateLimiting();
+
+      const response = await fetch(url);
+
+      // Update rate limit state based on response headers
+      updateRateLimit(response.headers);
+
+      if (response.status === 429) { // Too Many Requests
+        const retryAfter = response.headers.get('Retry-After');
+        const resetSeconds = parseInt(response.headers.get('X-Ratelimit-Reset'));
+        let waitTime;
+
+        if (retryAfter) {
+          waitTime = parseInt(retryAfter) * 1000;
+          console.warn(`Received 429. Retry-After header found. Retrying after ${waitTime / 1000} seconds.`);
+        } else if (!isNaN(resetSeconds)) {
+          waitTime = resetSeconds * 1000;
+          console.warn(`Received 429. X-Ratelimit-Reset found. Retrying after ${resetSeconds} seconds.`);
+        } else {
+          waitTime = delayMs;
+          console.warn(`Received 429. No specific retry time found. Retrying after ${waitTime / 1000} seconds.`);
+        }
+
+        await wait(waitTime);
+        continue;
+      }
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      // Decrement remaining count
+      if (rateLimit.remaining > 0) {
+        rateLimit.remaining -= 1;
+      }
+
+      return response;
+    } catch (error) {
+      console.error(`Fetch attempt ${attempt + 1} failed:`, error);
+      if (attempt < retries - 1) {
+        console.log(`Retrying in ${delayMs} ms...`);
+        await wait(delayMs);
+      } else {
+        throw error;
+      }
+    }
+  }
 }
 
 // Modify the GET function to be a regular async function
@@ -91,7 +199,8 @@ async function fetchTokens(request) {
           const url = `https://data.xrplf.org/v1/iou/exchange_rates/${base}/${counter}`;
 
           try {
-            const response = await fetch(url);
+            // Use the limiter to schedule requests
+            const response = await limiter.schedule(() => fetchWithRetry(url));
             const data = await response.json();
             updatedToken.xrpPrice = data.rate;
 
@@ -133,59 +242,6 @@ async function fetchTokens(request) {
 }
 
 // Modify the function for periodic updates to improve performance
-// Add a global rate limit tracker
-let requestsMade = 0;
-let rateLimitResetTime = Date.now() + 3600000; // 1 hour from now
-
-// Modify the fetchWithRetry function
-async function fetchWithRetry(url, retries = 3, delay = 1000) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      // Check global rate limit
-      if (requestsMade >= 10000 && Date.now() < rateLimitResetTime) {
-        const waitTime = rateLimitResetTime - Date.now();
-        console.log(`Global rate limit reached. Waiting for ${waitTime}ms before next request.`);
-        await new Promise(resolve => setTimeout(resolve, waitTime));
-        requestsMade = 0;
-        rateLimitResetTime = Date.now() + 3600000;
-      }
-
-      const response = await fetch(url, {
-        headers: {
-          'Accept': 'application/json'
-        }
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-
-      // Update global rate limit tracker
-      requestsMade++;
-
-      // Handle rate limiting headers
-      const remainingRequests = parseInt(response.headers.get('x-ratelimit-remaining'));
-      const resetTime = parseInt(response.headers.get('x-ratelimit-reset'));
-
-      if (remainingRequests <= 1) {
-        console.log(`Rate limit nearly reached. Waiting for ${resetTime} seconds.`);
-        await new Promise(resolve => setTimeout(resolve, resetTime * 1000));
-      }
-
-      return response;
-    } catch (error) {
-      if (error.message.includes('429')) {
-        console.log(`Rate limit exceeded. Retrying after ${delay}ms.`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-        continue;
-      }
-      if (i === retries - 1) throw error;
-      await new Promise(resolve => setTimeout(resolve, delay * (i + 1))); // Exponential backoff
-    }
-  }
-}
-
-// Modify the updatePricesAndMarketCaps function
 async function updatePricesAndMarketCaps() {
   console.time('Database update');
   const { db } = await connectToDatabase();
@@ -195,7 +251,7 @@ async function updatePricesAndMarketCaps() {
   
   console.log(`Starting update for ${tokens.length} tokens`);
 
-  const batchSize = 50;
+  const batchSize = 50; // Adjust this value based on your system's capabilities
   const batches = Math.ceil(tokens.length / batchSize);
 
   for (let i = 0; i < batches; i++) {
@@ -207,7 +263,8 @@ async function updatePricesAndMarketCaps() {
         const url = `https://data.xrplf.org/v1/iou/exchange_rates/${base}/${counter}`;
 
         try {
-          const response = await fetchWithRetry(url);
+          // Use the limiter to schedule requests
+          const response = await limiter.schedule(() => fetchWithRetry(url));
           const data = await response.json();
           const xrpPrice = data.rate;
 
@@ -249,15 +306,12 @@ async function updatePricesAndMarketCaps() {
     }
 
     console.log(`Processed batch ${i + 1} of ${batches}`);
-
-    // Add a delay between batches to avoid hitting rate limits
-    if (i < batches - 1) {
-      await new Promise(resolve => setTimeout(resolve, 1000)); // 1 second delay
-    }
   }
 
   console.timeEnd('Database update');
-  console.log("Prices, market caps, last updated times, and 'King of the hill' status updated successfully");
+  console.log(
+    "Prices, market caps, last updated times, and 'King of the hill' status updated successfully"
+  );
 }
 
 // Export the functions

@@ -9,6 +9,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "bottleneck": "^2.19.5",
     "mongodb": "^6.9.0",
     "node-fetch": "^3.3.2"
   }
