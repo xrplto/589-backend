@@ -19,7 +19,9 @@ function encodeCurrencyCode(currencyCode) {
     return currencyCode.toUpperCase();
   } else {
     // Convert to hex and pad to 40 characters
-    let hexCode = Buffer.from(currencyCode, 'ascii').toString('hex').toUpperCase();
+    let hexCode = Buffer.from(currencyCode, 'ascii')
+      .toString('hex')
+      .toUpperCase();
     while (hexCode.length < 40) {
       hexCode += '0';
     }
@@ -41,59 +43,123 @@ async function updateMarketData() {
     // Intervals to fetch data for
     const intervals = [
       '1m',
-      '3m',
       '5m',
       '15m',
       '30m',
-      '45m',
       '1h',
-      '2h',
-      '3h',
       '4h',
-      '1d', // Added '1d' interval for daily data
+      '1d',
+      '1M',
     ];
 
-    // Define the start date for historical data (e.g., 30 days ago)
-    const startDate = new Date();
-    startDate.setDate(startDate.getDate() - 30);
-    const formattedStartDate = startDate.toISOString().split('.')[0] + 'Z';
+    // Mapping of intervals to maximum days of history
+    const intervalHistoryDays = {
+      '1m': 1,      // last 1 day
+      '5m': 3,      // last 3 days
+      '15m': 7,     // last 7 days
+      '30m': 14,    // last 14 days
+      '1h': 30,     // last 30 days
+      '4h': 90,     // last 90 days
+      '1d': 365,    // last 1 year
+      '1M': 1825,   // last 5 years
+    };
+
+    // Define the end date as now
+    const endDate = new Date();
+    const formattedEndDate = endDate.toISOString().split('.')[0] + 'Z';
 
     for (const token of tokens) {
       // Encode currency code if necessary
       const currencyCodeEncoded = encodeCurrencyCode(token.currencyCode);
-      const baseIdentifier = `${token.issuer}_${currencyCodeEncoded}`;
+
+      // Construct base identifier
+      let base;
+      if (token.currencyCode === 'XRP') {
+        base = 'XRP';
+      } else {
+        base = `${token.issuer}_${currencyCodeEncoded}`;
+      }
+
+      // Counter currency
+      const counter = 'XRP';
+
       console.log(`Processing token: ${token.symbol}`);
-      console.log(`Base identifier: ${baseIdentifier}`);
+      console.log(`Base identifier: ${base}`);
 
       // Object to store chart data for different intervals
       const chartData = {};
 
       for (const interval of intervals) {
-        console.log(`Fetching historical data for ${token.symbol} at interval ${interval}`);
-        const apiUrl = `https://data.xrplf.org/v1/iou/ticker_data/${baseIdentifier}/XRP?interval=${interval}&date=${formattedStartDate}&only_amm=false`;
+        console.log(
+          `Fetching historical data for ${token.symbol} at interval ${interval}`
+        );
 
-        const response = await fetch(apiUrl);
+        // Calculate start date based on interval
+        const historyDays = intervalHistoryDays[interval] || 30; // default to last 30 days
+        const startDate = new Date();
+        startDate.setDate(endDate.getDate() - historyDays);
+        const formattedStartDate = startDate.toISOString().split('.')[0] + 'Z';
 
-        if (!response.ok) {
-          console.error(`Error fetching data for ${token.symbol} at interval ${interval}: ${response.statusText}`);
-          continue;
+        // Initialize variables for pagination
+        let skip = 0;
+        const limit = 500; // Adjust as necessary
+        let hasMoreData = true;
+        chartData[interval] = [];
+
+        while (hasMoreData) {
+          // Construct API URL with pagination
+          const apiUrl = `https://data.xrplf.org/v1/iou/market_data/${base}/${counter}?interval=${interval}&start=${formattedStartDate}&end=${formattedEndDate}&exclude_amm=false&descending=false&skip=${skip}&limit=${limit}`;
+          console.log(`Fetching data from URL: ${apiUrl}`);
+
+          try {
+            const response = await fetch(apiUrl);
+
+            if (!response.ok) {
+              console.error(
+                `Error fetching data for ${token.symbol} at interval ${interval}: ${response.statusText}`
+              );
+              hasMoreData = false;
+              break;
+            }
+
+            const data = await response.json();
+
+            if (Array.isArray(data) && data.length > 0) {
+              // Append data to chartData for this interval
+              chartData[interval] = chartData[interval].concat(data);
+              skip += data.length;
+            } else {
+              hasMoreData = false;
+            }
+
+            // If the number of returned entries is less than the limit, we've reached the end
+            if (!Array.isArray(data) || data.length < limit) {
+              hasMoreData = false;
+            }
+          } catch (error) {
+            console.error(
+              `Error fetching data for ${token.symbol} at interval ${interval}:`,
+              error
+            );
+            hasMoreData = false;
+          }
         }
 
-        const data = await response.json();
-
-        if (data.length > 0) {
-          // Store data in chartData for this interval
-          chartData[interval] = data;
-        } else {
-          console.log(`No data found for ${token.symbol} at interval ${interval}`);
+        if (chartData[interval].length === 0) {
+          console.log(
+            `No data found for ${token.symbol} at interval ${interval}`
+          );
+          delete chartData[interval]; // Remove empty intervals
         }
       }
 
       // Use the latest data point from '1m' interval to update xrpPrice and King of the Hill
       if (chartData['1m'] && chartData['1m'].length > 0) {
-        const latestDataPoint = chartData['1m'][chartData['1m'].length - 1];
+        // Select the latest data point
+        const latestDataPoint =
+          chartData['1m'][chartData['1m'].length - 1];
 
-        const xrpPrice = latestDataPoint.last;
+        const xrpPrice = latestDataPoint.close;
         const marketCap = xrpPrice * parseFloat(token.totalSupply);
 
         // Prepare update object
@@ -103,12 +169,12 @@ async function updateMarketData() {
           lastUpdated: new Date(),
           base_volume: latestDataPoint.base_volume,
           counter_volume: latestDataPoint.counter_volume,
-          open: latestDataPoint.first,
+          open: latestDataPoint.open,
           high: latestDataPoint.high,
           low: latestDataPoint.low,
-          close: latestDataPoint.last,
+          close: latestDataPoint.close,
           exchanges: latestDataPoint.exchanges,
-          timestamp: new Date(latestDataPoint.date_to),
+          timestamp: new Date(latestDataPoint.timestamp),
         };
 
         // Check for "King of the Hill" status
@@ -128,10 +194,10 @@ async function updateMarketData() {
         );
 
         console.log(
-          `Updated ${token.symbol}: Price=${xrpPrice} XRP, Market Cap=${marketCap} XRP`
+          `Updated ${token.symbol}: Price=${xrpPrice}, Market Cap=${marketCap}`
         );
       } else {
-        console.log(`No 1m market data found for ${token.symbol} (${baseIdentifier})`);
+        console.log(`No 1m market data found for ${token.symbol} (${base})`);
       }
 
       // Update the token with historical chart data
@@ -145,6 +211,7 @@ async function updateMarketData() {
         console.log(`Updated chart data for ${token.symbol}`);
       }
     }
+
 
     console.log('Market data update completed');
   } catch (error) {
