@@ -12,11 +12,16 @@ const MONGODB_URI = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017";
 const DB_NAME = process.env.DB_NAME || "xrpFun";
 const COLLECTION_NAME = process.env.COLLECTION_NAME || "coins";
 
-// XRPL WebSocket servers
+// Add these constants at the top of the file
+const MAX_CONNECTIONS = 5;
+const MAX_MESSAGES_PER_MINUTE = 1000;
+const MESSAGE_INTERVAL = 60000 / MAX_MESSAGES_PER_MINUTE; // Milliseconds between messages
+
+// Modify the XRPL_WSS_LIST to prioritize other nodes
 const XRPL_WSS_LIST = [
   "wss://s2.ripple.com/",
-  "wss://xrplcluster.com/",
   "wss://s1.ripple.com/",
+  "wss://xrplcluster.com/", // Move this to the end of the list
 ];
 
 // Create a cached database connection
@@ -41,35 +46,52 @@ async function connectToDatabase() {
 }
 
 async function getAMMInfo(asset, asset2) {
-  return new Promise((resolve, reject) => {
-    // Randomly select a WebSocket server from the list
-    const randomIndex = Math.floor(Math.random() * XRPL_WSS_LIST.length);
-    const selectedWSS = XRPL_WSS_LIST[randomIndex];
-    const ws = new WebSocket(selectedWSS);
+  for (const selectedWSS of XRPL_WSS_LIST) {
+    try {
+      if (selectedWSS.includes("xrplcluster.com")) {
+        // Respect the rate limit for xrplcluster.com
+        await new Promise(resolve => setTimeout(resolve, MESSAGE_INTERVAL));
+      }
 
-    ws.on("open", () => {
-      const request = {
-        command: "amm_info",
-        asset: asset,
-        asset2: asset2,
-      };
+      const result = await new Promise((resolve, reject) => {
+        const ws = new WebSocket(selectedWSS);
 
-      ws.send(JSON.stringify(request));
-    });
+        const timeout = setTimeout(() => {
+          ws.close();
+          reject(new Error("WebSocket connection timeout"));
+        }, 10000); // 10 seconds timeout
 
-    ws.on("message", (data) => {
-      const response = JSON.parse(data);
-      console.log("AMM Info Response:", JSON.stringify(response, null, 2));
-      ws.close();
-      resolve(response.result);
-    });
+        ws.on("open", () => {
+          clearTimeout(timeout);
+          const request = {
+            command: "amm_info",
+            asset: asset,
+            asset2: asset2,
+          };
+          ws.send(JSON.stringify(request));
+        });
 
-    ws.on("error", (error) => {
+        ws.on("message", (data) => {
+          const response = JSON.parse(data);
+          ws.close();
+          resolve(response.result);
+        });
+
+        ws.on("error", (error) => {
+          clearTimeout(timeout);
+          ws.close();
+          reject(new Error(`Node ${selectedWSS} error: ${error.message}`));
+        });
+      });
+
+      return result;
+    } catch (error) {
       console.error(`Error with node ${selectedWSS}:`, error.message);
-      ws.close();
-      reject(new Error(`Node ${selectedWSS} error: ${error.message}`));
-    });
-  });
+      // Continue to the next node if there's an error
+    }
+  }
+
+  throw new Error("Failed to get AMM info from all available nodes");
 }
 
 // Function to fetch and update AMM info, prices, market caps, and King of the Hill status
@@ -80,18 +102,13 @@ async function updateAMMInfo() {
     const { db } = await connectToDatabase();
     const collection = db.collection(COLLECTION_NAME);
 
-    // Find all tokens with an ammAddress
     const tokens = await collection
       .find({ ammAddress: { $exists: true, $ne: "" } })
       .toArray();
 
     console.log(`Starting update for ${tokens.length} tokens`);
 
-    // Set concurrency limit
-    const concurrencyLimit = 5; // Adjust this value as needed
-
-    // Process tokens with concurrency control
-    await processTokens(tokens, concurrencyLimit, collection);
+    await processTokens(tokens, collection);
 
     console.log(
       "AMM information, prices, market caps, price changes, and 'King of the Hill' status updated successfully"
@@ -103,28 +120,18 @@ async function updateAMMInfo() {
   }
 }
 
-// Function to process tokens with concurrency control
-async function processTokens(tokens, concurrencyLimit, collection) {
-  let index = 0;
-
-  async function next() {
-    if (index >= tokens.length) {
-      return;
+// Modify the processTokens function to respect the connection limit
+async function processTokens(tokens, collection) {
+  const batchSize = MAX_CONNECTIONS;
+  for (let i = 0; i < tokens.length; i += batchSize) {
+    const batch = tokens.slice(i, i + batchSize);
+    await Promise.all(batch.map(token => processToken(token, collection)));
+    
+    // Add a delay between batches to respect the rate limit
+    if (i + batchSize < tokens.length) {
+      await new Promise(resolve => setTimeout(resolve, MESSAGE_INTERVAL * batchSize));
     }
-    const currentIndex = index++;
-    const token = tokens[currentIndex];
-
-    await processToken(token, collection);
-
-    return next();
   }
-
-  const workers = [];
-  for (let i = 0; i < concurrencyLimit; i++) {
-    workers.push(next());
-  }
-
-  await Promise.all(workers);
 }
 
 // Function to process a single token
@@ -161,6 +168,10 @@ async function processToken(token, collection) {
       marketCapBN = spotPriceBN.multipliedBy(token.totalSupply);
     }
 
+    // Calculate total liquidity in XRP
+    const tokenLiquidityInXRP = tokenAmountBN.multipliedBy(spotPriceBN);
+    const totalLiquidityXRP = xrpAmountBN.plus(tokenLiquidityInXRP);
+
     // Check for King of the Hill status
     let kingOfTheHill = token.kingOfTheHill;
     const threshold = new BigNumber(58900); // Set your threshold value here
@@ -171,28 +182,10 @@ async function processToken(token, collection) {
       };
     }
 
-    // Store historical prices
-    const priceHistoryEntry = {
-      timestamp: new Date(),
-      spotPrice: spotPriceBN.toFixed(), // Use toFixed() to ensure decimal notation
-    };
-
-    // Fetch existing price history
-    const existingPriceHistory = token.priceHistory || [];
-
-    // Append the new price to the history
-    existingPriceHistory.push(priceHistoryEntry);
-
-    // Keep only the necessary history (e.g., last 7 days)
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    const updatedPriceHistory = existingPriceHistory.filter(
-      (entry) => new Date(entry.timestamp) >= sevenDaysAgo
-    );
-
     // Calculate price changes
-    const priceChange1h = calculatePriceChange(existingPriceHistory, 1);
-    const priceChange24h = calculatePriceChange(existingPriceHistory, 24);
-    const priceChange7d = calculatePriceChange(existingPriceHistory, 168); // 7 days * 24 hours
+    const priceChange1h = calculatePriceChange(token.spotPrice, spotPriceBN, 1);
+    const priceChange24h = calculatePriceChange(token.spotPrice, spotPriceBN, 24);
+    const priceChange7d = calculatePriceChange(token.spotPrice, spotPriceBN, 168); // 7 days * 24 hours
 
     console.log(`AMM Liquidity for ${token.symbol}:`);
     console.log(`XRP: ${xrpAmountBN.toFixed(6)} XRP`);
@@ -206,12 +199,13 @@ async function processToken(token, collection) {
       `Price per XRP: ${pricePerXRPBN.toFixed(6)} ${token.symbol} per XRP`
     );
     console.log(`Market Cap: ${marketCapBN.toFixed()} XRP`);
-    console.log(`Price Change 1h: ${priceChange1h.toFixed(2)}%`);
-    console.log(`Price Change 24h: ${priceChange24h.toFixed(2)}%`);
-    console.log(`Price Change 7d: ${priceChange7d.toFixed(2)}%`);
+    console.log(`Total Liquidity: ${totalLiquidityXRP.toFixed(6)} XRP`);
     if (kingOfTheHill) {
       console.log(`King of the Hill Status: ${kingOfTheHill.label}`);
     }
+    console.log(`Price Change 1h: ${priceChange1h.toFixed(2)}%`);
+    console.log(`Price Change 24h: ${priceChange24h.toFixed(2)}%`);
+    console.log(`Price Change 7d: ${priceChange7d.toFixed(2)}%`);
     console.log("---");
 
     // Update the token document with all the new information
@@ -221,21 +215,15 @@ async function processToken(token, collection) {
       spotPrice: spotPriceBN.toFixed(),
       pricePerXRP: pricePerXRPBN.toFixed(),
       marketCap: marketCapBN.toFixed(),
-      priceHistory: updatedPriceHistory,
+      totalLiquidity: totalLiquidityXRP.toFixed(6),
       priceChange1h: priceChange1h.toFixed(2),
       priceChange24h: priceChange24h.toFixed(2),
       priceChange7d: priceChange7d.toFixed(2),
+      lastUpdated: new Date(), // Always update the lastUpdated field
     };
 
     if (kingOfTheHill) {
       updateFields.kingOfTheHill = kingOfTheHill;
-    }
-
-    // Avoid duplicate 'lastUpdated' fields
-    if (token.lastUpdated) {
-      updateFields.lastUpdated = token.lastUpdated;
-    } else {
-      updateFields.lastUpdated = new Date();
     }
 
     await collection.updateOne(
@@ -261,34 +249,14 @@ async function processToken(token, collection) {
   }
 }
 
-// Function to calculate price change over a specified number of hours
-function calculatePriceChange(priceHistory, hoursAgo) {
-  const now = Date.now();
-  const targetTime = now - hoursAgo * 60 * 60 * 1000;
-
-  // Find the oldest price entry after the target time
-  const pastPriceEntry = priceHistory.find(
-    (entry) => new Date(entry.timestamp).getTime() >= targetTime
-  );
-
-  // If we have enough data, calculate the percentage change
-  if (pastPriceEntry) {
-    const pastPrice = new BigNumber(pastPriceEntry.spotPrice);
-    const currentPrice = new BigNumber(
-      priceHistory[priceHistory.length - 1].spotPrice
-    );
-    if (pastPrice.isZero()) {
-      return new BigNumber(0);
-    }
-    const priceChange = currentPrice
-      .minus(pastPrice)
-      .dividedBy(pastPrice)
-      .multipliedBy(100);
-    return priceChange;
-  } else {
-    // Not enough data to calculate price change
-    return new BigNumber(0);
-  }
+// Function to calculate price change
+function calculatePriceChange(oldPrice, newPrice, hours) {
+  if (!oldPrice) return new BigNumber(0);
+  const oldPriceBN = new BigNumber(oldPrice);
+  if (oldPriceBN.isZero()) return new BigNumber(0);
+  
+  const priceChange = newPrice.minus(oldPriceBN).dividedBy(oldPriceBN).multipliedBy(100);
+  return priceChange;
 }
 
 // Export the function
