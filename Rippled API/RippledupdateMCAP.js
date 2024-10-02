@@ -1,8 +1,9 @@
-const { MongoClient } = require("mongodb");
+const { MongoClient, ObjectId } = require("mongodb");
 const WebSocket = require("ws");
 const BigNumber = require("bignumber.js");
 const fetch = (...args) =>
   import("node-fetch").then(({ default: fetch }) => fetch(...args));
+const Bottleneck = require("bottleneck"); // Import Bottleneck
 
 // Set BigNumber configuration to avoid scientific notation
 BigNumber.config({ EXPONENTIAL_AT: 1e9 });
@@ -12,16 +13,24 @@ const MONGODB_URI = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017";
 const DB_NAME = process.env.DB_NAME || "xrpFun";
 const COLLECTION_NAME = process.env.COLLECTION_NAME || "coins";
 
-// Add these constants at the top of the file
-const MAX_CONNECTIONS = 5;
-const MAX_MESSAGES_PER_MINUTE = 1000;
-const MESSAGE_INTERVAL = 60000 / MAX_MESSAGES_PER_MINUTE; // Milliseconds between messages
+// Rate limiting constants for xrplcluster.com
+const XRPL_MAX_CONNECTIONS = 5;
+const XRPL_MAX_MESSAGES_PER_MINUTE = 1000;
+
+// Create a Bottleneck limiter for xrplcluster.com
+const xrplClusterLimiter = new Bottleneck({
+  reservoir: XRPL_MAX_MESSAGES_PER_MINUTE, // Number of messages
+  reservoirRefreshAmount: XRPL_MAX_MESSAGES_PER_MINUTE,
+  reservoirRefreshInterval: 60 * 1000, // Refresh every minute
+  maxConcurrent: XRPL_MAX_CONNECTIONS, // Max concurrent connections
+  minTime: Math.ceil(60000 / XRPL_MAX_MESSAGES_PER_MINUTE), // Minimum time between messages
+});
 
 // Modify the XRPL_WSS_LIST to prioritize other nodes
 const XRPL_WSS_LIST = [
   "wss://s2.ripple.com/",
   "wss://s1.ripple.com/",
-  "wss://xrplcluster.com/", // Move this to the end of the list
+  "wss://xrplcluster.com/", // This node has rate limits
 ];
 
 // Create a cached database connection
@@ -49,42 +58,17 @@ async function getAMMInfo(asset, asset2) {
   for (const selectedWSS of XRPL_WSS_LIST) {
     try {
       if (selectedWSS.includes("xrplcluster.com")) {
-        // Respect the rate limit for xrplcluster.com
-        await new Promise(resolve => setTimeout(resolve, MESSAGE_INTERVAL));
+        // Use the Bottleneck limiter for xrplcluster.com
+        const limitedFetch = xrplClusterLimiter.wrap(() =>
+          fetchAMMInfo(selectedWSS, asset, asset2)
+        );
+        const result = await limitedFetch();
+        return result;
+      } else {
+        // For other nodes, proceed without rate limiting
+        const result = await fetchAMMInfo(selectedWSS, asset, asset2);
+        return result;
       }
-
-      const result = await new Promise((resolve, reject) => {
-        const ws = new WebSocket(selectedWSS);
-
-        const timeout = setTimeout(() => {
-          ws.close();
-          reject(new Error("WebSocket connection timeout"));
-        }, 10000); // 10 seconds timeout
-
-        ws.on("open", () => {
-          clearTimeout(timeout);
-          const request = {
-            command: "amm_info",
-            asset: asset,
-            asset2: asset2,
-          };
-          ws.send(JSON.stringify(request));
-        });
-
-        ws.on("message", (data) => {
-          const response = JSON.parse(data);
-          ws.close();
-          resolve(response.result);
-        });
-
-        ws.on("error", (error) => {
-          clearTimeout(timeout);
-          ws.close();
-          reject(new Error(`Node ${selectedWSS} error: ${error.message}`));
-        });
-      });
-
-      return result;
     } catch (error) {
       console.error(`Error with node ${selectedWSS}:`, error.message);
       // Continue to the next node if there's an error
@@ -92,6 +76,48 @@ async function getAMMInfo(asset, asset2) {
   }
 
   throw new Error("Failed to get AMM info from all available nodes");
+}
+
+function fetchAMMInfo(selectedWSS, asset, asset2) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(selectedWSS);
+
+    const timeout = setTimeout(() => {
+      ws.close();
+      reject(new Error("WebSocket connection timeout"));
+    }, 10000); // 10 seconds timeout
+
+    ws.on("open", () => {
+      clearTimeout(timeout);
+      const request = {
+        command: "amm_info",
+        asset: asset,
+        asset2: asset2,
+      };
+      ws.send(JSON.stringify(request));
+    });
+
+    ws.on("message", (data) => {
+      try {
+        const response = JSON.parse(data);
+        ws.close();
+        if (response.result) {
+          resolve(response.result);
+        } else {
+          reject(new Error("Invalid response format"));
+        }
+      } catch (parseError) {
+        ws.close();
+        reject(new Error("Failed to parse WebSocket message"));
+      }
+    });
+
+    ws.on("error", (error) => {
+      clearTimeout(timeout);
+      ws.close();
+      reject(new Error(`Node ${selectedWSS} error: ${error.message}`));
+    });
+  });
 }
 
 // Function to fetch and update AMM info, prices, market caps, and King of the Hill status
@@ -111,7 +137,7 @@ async function updateAMMInfo() {
     await processTokens(tokens, collection);
 
     console.log(
-      "AMM information, prices, market caps, price changes, and 'King of the Hill' status updated successfully"
+      "AMM information, prices, market caps, and 'King of the Hill' status updated successfully"
     );
   } catch (error) {
     console.error("Error during AMM information update:", error);
@@ -120,18 +146,26 @@ async function updateAMMInfo() {
   }
 }
 
-// Modify the processTokens function to respect the connection limit
+// Modify the processTokens function to maximize throughput while respecting rate limits
 async function processTokens(tokens, collection) {
-  const batchSize = MAX_CONNECTIONS;
-  for (let i = 0; i < tokens.length; i += batchSize) {
-    const batch = tokens.slice(i, i + batchSize);
-    await Promise.all(batch.map(token => processToken(token, collection)));
-    
-    // Add a delay between batches to respect the rate limit
-    if (i + batchSize < tokens.length) {
-      await new Promise(resolve => setTimeout(resolve, MESSAGE_INTERVAL * batchSize));
-    }
+  // Process all tokens concurrently, but limit the concurrency to prevent overwhelming the system
+  const concurrency = 50; // Adjust based on your system's capacity
+  const queue = [...tokens];
+  const promises = [];
+
+  for (let i = 0; i < concurrency; i++) {
+    const worker = async () => {
+      while (queue.length > 0) {
+        const token = queue.shift();
+        if (token) {
+          await processToken(token, collection);
+        }
+      }
+    };
+    promises.push(worker());
   }
+
+  await Promise.all(promises);
 }
 
 // Function to process a single token
@@ -172,6 +206,19 @@ async function processToken(token, collection) {
     const tokenLiquidityInXRP = tokenAmountBN.multipliedBy(spotPriceBN);
     const totalLiquidityXRP = xrpAmountBN.plus(tokenLiquidityInXRP);
 
+    // Calculate pool balance
+    const xrpPercentage = xrpAmountBN
+      .dividedBy(totalLiquidityXRP)
+      .multipliedBy(100);
+    const tokenPercentage = tokenLiquidityInXRP
+      .dividedBy(totalLiquidityXRP)
+      .multipliedBy(100);
+    const poolImbalance = xrpAmountBN.minus(tokenLiquidityInXRP);
+    const poolImbalancePercentage = poolImbalance
+      .dividedBy(totalLiquidityXRP)
+      .multipliedBy(100)
+      .abs();
+
     // Check for King of the Hill status
     let kingOfTheHill = token.kingOfTheHill;
     const threshold = new BigNumber(58900); // Set your threshold value here
@@ -182,30 +229,36 @@ async function processToken(token, collection) {
       };
     }
 
-    // Calculate price changes
-    const priceChange1h = calculatePriceChange(token.spotPrice, spotPriceBN, 1);
-    const priceChange24h = calculatePriceChange(token.spotPrice, spotPriceBN, 24);
-    const priceChange7d = calculatePriceChange(token.spotPrice, spotPriceBN, 168); // 7 days * 24 hours
-
     console.log(`AMM Liquidity for ${token.symbol}:`);
-    console.log(`XRP: ${xrpAmountBN.toFixed(6)} XRP`);
     console.log(
-      `${token.symbol}: ${tokenAmountBN.toFixed(6)} ${token.symbol}`
+      `XRP: ${xrpAmountBN.toFixed(6)} XRP (${xrpPercentage.toFixed(2)}% of pool)`
     );
     console.log(
-      `Spot Price: ${spotPriceBN.toFixed()} XRP per ${token.symbol}`
+      `${token.symbol}: ${tokenAmountBN.toFixed(6)} ${token.symbol} (${tokenLiquidityInXRP.toFixed(
+        6
+      )} XRP, ${tokenPercentage.toFixed(2)}% of pool)`
     );
+    console.log(`Total Liquidity: ${totalLiquidityXRP.toFixed(6)} XRP`);
+    console.log(
+      `Pool Imbalance: ${poolImbalance.toFixed(
+        6
+      )} XRP (${poolImbalancePercentage.toFixed(2)}%)`
+    );
+    console.log(
+      `Pool Health: ${
+        assessPoolHealth(poolImbalancePercentage.toNumber()).status
+      } - ${
+        assessPoolHealth(poolImbalancePercentage.toNumber()).message
+      }`
+    );
+    console.log(`Spot Price: ${spotPriceBN.toFixed()} XRP per ${token.symbol}`);
     console.log(
       `Price per XRP: ${pricePerXRPBN.toFixed(6)} ${token.symbol} per XRP`
     );
     console.log(`Market Cap: ${marketCapBN.toFixed()} XRP`);
-    console.log(`Total Liquidity: ${totalLiquidityXRP.toFixed(6)} XRP`);
     if (kingOfTheHill) {
       console.log(`King of the Hill Status: ${kingOfTheHill.label}`);
     }
-    console.log(`Price Change 1h: ${priceChange1h.toFixed(2)}%`);
-    console.log(`Price Change 24h: ${priceChange24h.toFixed(2)}%`);
-    console.log(`Price Change 7d: ${priceChange7d.toFixed(2)}%`);
     console.log("---");
 
     // Update the token document with all the new information
@@ -216,9 +269,24 @@ async function processToken(token, collection) {
       pricePerXRP: pricePerXRPBN.toFixed(),
       marketCap: marketCapBN.toFixed(),
       totalLiquidity: totalLiquidityXRP.toFixed(6),
-      priceChange1h: priceChange1h.toFixed(2),
-      priceChange24h: priceChange24h.toFixed(2),
-      priceChange7d: priceChange7d.toFixed(2),
+      xrpLiquidity: {
+        amount: xrpAmountBN.toFixed(6),
+        percentage: xrpPercentage.toFixed(2),
+      },
+      tokenLiquidity: {
+        amount: tokenAmountBN.toFixed(6),
+        xrpValue: tokenLiquidityInXRP.toFixed(6),
+        percentage: tokenPercentage.toFixed(2),
+      },
+      poolImbalance: {
+        amount: poolImbalance.toFixed(6),
+        percentage: poolImbalancePercentage.toFixed(2),
+        health: {
+          status: assessPoolHealth(poolImbalancePercentage.toNumber()).status,
+          message:
+            assessPoolHealth(poolImbalancePercentage.toNumber()).message,
+        },
+      },
       lastUpdated: new Date(), // Always update the lastUpdated field
     };
 
@@ -249,14 +317,19 @@ async function processToken(token, collection) {
   }
 }
 
-// Function to calculate price change
-function calculatePriceChange(oldPrice, newPrice, hours) {
-  if (!oldPrice) return new BigNumber(0);
-  const oldPriceBN = new BigNumber(oldPrice);
-  if (oldPriceBN.isZero()) return new BigNumber(0);
-  
-  const priceChange = newPrice.minus(oldPriceBN).dividedBy(oldPriceBN).multipliedBy(100);
-  return priceChange;
+// Add this function to assess pool health
+function assessPoolHealth(imbalancePercentage) {
+  if (imbalancePercentage <= 1) {
+    return { status: "Excellent", message: "Pool is well-balanced" };
+  } else if (imbalancePercentage <= 3) {
+    return { status: "Good", message: "Pool is slightly imbalanced" };
+  } else if (imbalancePercentage <= 5) {
+    return { status: "Fair", message: "Pool imbalance is noticeable" };
+  } else if (imbalancePercentage <= 10) {
+    return { status: "Poor", message: "Pool is significantly imbalanced" };
+  } else {
+    return { status: "Critical", message: "Pool is severely imbalanced" };
+  }
 }
 
 // Export the function
@@ -265,19 +338,37 @@ module.exports = {
 };
 
 // Main function to include more detailed logging and prevent overlapping runs
+let isUpdating = false;
+
 async function main() {
   try {
     // Ensure fetch is available before starting the update loop
     await fetch;
 
-    console.log("Starting initial AMM update...");
+    console.log("Starting continuous AMM updates...");
+
     while (true) {
-      await updateAMMInfo();
-      console.log("AMM update completed successfully");
-      // No wait here, updates will run continuously
+      if (!isUpdating) {
+        isUpdating = true;
+        updateAMMInfo()
+          .then(() => {
+            isUpdating = false;
+            // Immediately proceed to the next update without waiting
+          })
+          .catch((error) => {
+            console.error("Error during AMM update:", error);
+            isUpdating = false;
+            // Optionally, implement a retry mechanism or delay on error
+          });
+      }
+
+      // Yield control to allow asynchronous operations
+      await new Promise((resolve) => setImmediate(resolve));
     }
   } catch (error) {
-    console.error("Error during initial AMM update:", error);
+    console.error("Error during continuous AMM updates:", error);
+    // Optionally, implement a retry mechanism or exit the process
+    process.exit(1);
   }
 }
 
