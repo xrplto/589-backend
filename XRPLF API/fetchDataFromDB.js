@@ -100,6 +100,16 @@ async function fetchDataFromDB() {
     // Fetch reward wallet info (without logging)
     const rewardWalletInfo = await fetchAccountInfo(xrplClient, REWARD_WALLET);
 
+    // Fetch and display token balances for the reward wallet
+    const rewardWalletLines = await fetchAccountLines(xrplClient, REWARD_WALLET);
+    console.log("\nReward Wallet Token Balances:");
+    for (const line of rewardWalletLines) {
+      if (parseFloat(line.balance) !== 0) {
+        console.log(`  ${line.currency}: ${line.balance}`);
+        console.log(`    Issuer: ${line.account}`);
+      }
+    }
+
     // Fetch all documents from the collection
     const documents = await collection.find({}).toArray();
 
