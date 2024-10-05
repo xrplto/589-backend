@@ -97,127 +97,54 @@ async function fetchDataFromDB() {
     xrplClient = new xrpl.Client(XRPL_SERVER);
     await xrplClient.connect();
 
-    // Fetch reward wallet info
+    // Fetch reward wallet info (without logging)
     const rewardWalletInfo = await fetchAccountInfo(xrplClient, REWARD_WALLET);
-    console.log("\nReward Wallet Info:");
-    console.log(`  Address: ${REWARD_WALLET}`);
-    console.log(
-      `  XRP Balance: ${xrpl.dropsToXrp(
-        rewardWalletInfo.account_data.Balance
-      )} XRP`
-    );
 
     // Fetch all documents from the collection
     const documents = await collection.find({}).toArray();
 
     if (documents.length > 0) {
-      console.log(`\nFetched ${documents.length} documents from the database.`);
-
-      for (const [index, doc] of documents.entries()) {
-        console.log(`\nProcessing Document ${index + 1}:`);
-        console.log(`  Currency Code: ${doc.currencyCode || "N/A"}`);
-        console.log(`  Issuer: ${doc.issuer || "N/A"}`);
-
-        // Fetch farm token info
-        if (doc.issuer && doc.currencyCode) {
-          const farmToken = await farmTokensCollection.findOne({
-            issuer: doc.issuer,
-            currencyCode: doc.currencyCode,
-          });
-
-          if (farmToken) {
-            console.log("  Farm Token Info:");
-            console.log(`    Name: ${farmToken.name}`);
-            console.log(`    Issuer: ${farmToken.issuer}`);
-            console.log(`    Currency Code: ${farmToken.currencyCode}`);
-
-            // Fetch issuer account info
-            const issuerInfo = await fetchAccountInfo(
-              xrplClient,
-              farmToken.issuer
-            );
-            if (issuerInfo) {
-              console.log("  Issuer Account Info:");
-              console.log(
-                `    XRP Balance: ${xrpl.dropsToXrp(
-                  issuerInfo.account_data.Balance
-                )} XRP`
-              );
-
-              // Fetch token supply
-              const tokenSupply = await fetchTokenSupply(
-                xrplClient,
-                farmToken.issuer,
-                farmToken.currencyCode
-              );
-              console.log(`    Token Supply: ${tokenSupply} ${farmToken.name}`);
-            }
-          } else {
-            console.log("  No matching farm token found in the database");
-          }
-        }
-
+      for (const doc of documents) {
         if (doc.wallet_address) {
-          console.log(`  Wallet Address: ${doc.wallet_address}`);
-
           if (!walletStats[doc.wallet_address]) {
             walletStats[doc.wallet_address] = {
               submissions: 0,
               nftCount: 0,
               matchingCollections: 0,
               nftsProcessed: false,
-              tokenBalances: {}, // Add this to store token balances
+              tokenBalances: {},
             };
           }
           walletStats[doc.wallet_address].submissions++;
 
-          // Fetch account info for the wallet
+          // Fetch account info for the wallet (without logging)
           const accountInfo = await fetchAccountInfo(
             xrplClient,
             doc.wallet_address
           );
-          if (accountInfo) {
-            console.log(
-              `  XRP Balance: ${xrpl.dropsToXrp(
-                accountInfo.account_data.Balance
-              )} XRP`
-            );
-          }
 
-          // Fetch and display token balances
+          // Fetch and store token balances
           const accountLines = await fetchAccountLines(
             xrplClient,
             doc.wallet_address
           );
-          if (accountLines.length > 0) {
-            console.log("  Token Balances:");
-            for (const line of accountLines) {
-              if (parseFloat(line.balance) !== 0) {
-                console.log(
-                  `    ${line.currency}: ${line.balance} (Issuer: ${line.account})`
-                );
+          for (const line of accountLines) {
+            if (parseFloat(line.balance) !== 0) {
+              const farmToken = await farmTokensCollection.findOne({
+                issuer: line.account,
+                currencyCode: line.currency,
+              });
 
-                // Check if this token is in farm_tokens collection
-                const farmToken = await farmTokensCollection.findOne({
+              if (farmToken) {
+                walletStats[doc.wallet_address].tokenBalances[farmToken.name] = {
+                  balance: line.balance,
                   issuer: line.account,
-                  currencyCode: line.currency,
-                });
-
-                if (farmToken) {
-                  walletStats[doc.wallet_address].tokenBalances[
-                    farmToken.name
-                  ] = {
-                    balance: line.balance,
-                    issuer: line.account,
-                  };
-                }
+                };
               }
             }
-          } else {
-            console.log("  No token balances found");
           }
 
-          // Only process NFTs if they haven't been processed for this wallet
+          // Process NFTs (without logging)
           if (!walletStats[doc.wallet_address].nftsProcessed) {
             let marker;
             let nfts = [];
@@ -233,41 +160,18 @@ async function fetchDataFromDB() {
 
             walletStats[doc.wallet_address].nftCount = nfts.length;
 
-            if (nfts.length > 0) {
-              for (const nft of nfts) {
-                // Match with nft_collections
-                const matchingCollection = await nftCollections.findOne({
-                  issuer: nft.Issuer,
-                  taxon: nft.NFTokenTaxon.toString(),
-                });
+            for (const nft of nfts) {
+              const matchingCollection = await nftCollections.findOne({
+                issuer: nft.Issuer,
+                taxon: nft.NFTokenTaxon.toString(),
+              });
 
-                if (matchingCollection) {
-                  walletStats[doc.wallet_address].matchingCollections++;
-                }
+              if (matchingCollection) {
+                walletStats[doc.wallet_address].matchingCollections++;
               }
             }
 
-            walletStats[doc.wallet_address].nftsProcessed = true; // Mark NFTs as processed for this wallet
-          }
-        }
-
-        if (doc.issuer && doc.currencyCode) {
-          // Check for the specific currency balance in the reward wallet
-          const rewardWalletLines = await xrplClient.request({
-            command: "account_lines",
-            account: REWARD_WALLET,
-            peer: doc.issuer,
-          });
-
-          const currencyBalance = rewardWalletLines.result.lines.find(
-            (line) => line.currency === doc.currencyCode
-          );
-          if (currencyBalance) {
-            console.log(
-              `  Reward Wallet ${doc.currencyCode} Balance: ${currencyBalance.balance}`
-            );
-          } else {
-            console.log(`  Reward Wallet ${doc.currencyCode} Balance: 0`);
+            walletStats[doc.wallet_address].nftsProcessed = true;
           }
         }
       }
@@ -277,11 +181,9 @@ async function fetchDataFromDB() {
         totalNFTCount += stats.nftCount;
         totalMatchingCollections += stats.matchingCollections;
       }
-    } else {
-      console.log("No documents found in the collection");
     }
 
-    // Display all statistics at the end
+    // Display only final statistics
     console.log("\n--- Final Statistics ---");
     console.log("\nPer Wallet Statistics:");
     for (const [wallet, stats] of Object.entries(walletStats)) {
