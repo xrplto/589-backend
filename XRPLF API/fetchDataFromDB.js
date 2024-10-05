@@ -31,6 +31,7 @@ async function fetchDataFromDB() {
   let xrplClient;
   let totalNFTCount = 0;
   let totalMatchingCollections = 0;
+  const walletStats = {};
 
   try {
     mongoClient = await MongoClient.connect(MONGODB_URI);
@@ -45,12 +46,21 @@ async function fetchDataFromDB() {
     const documents = await collection.find({}).toArray();
 
     if (documents.length > 0) {
-      console.log(`Fetched ${documents.length} documents from the database:`);
+      console.log(`Fetched ${documents.length} documents from the database.`);
+      
       for (const [index, doc] of documents.entries()) {
-        console.log(`\nDocument ${index + 1}:`);
-        console.log(JSON.stringify(doc, null, 2));
-
+        console.log(`\nProcessing Document ${index + 1}:`);
+        
         if (doc.wallet_address) {
+          if (!walletStats[doc.wallet_address]) {
+            walletStats[doc.wallet_address] = {
+              submissions: 0,
+              nftCount: 0,
+              matchingCollections: 0
+            };
+          }
+          walletStats[doc.wallet_address].submissions++;
+
           let marker;
           let nfts = [];
           do {
@@ -59,16 +69,11 @@ async function fetchDataFromDB() {
             marker = result.marker;
           } while (marker);
 
-          console.log(`NFT count for ${doc.wallet_address}: ${nfts.length}`);
+          walletStats[doc.wallet_address].nftCount = nfts.length;
           totalNFTCount += nfts.length;
 
-          let addressMatchingCollections = 0;
-
           if (nfts.length > 0) {
-            console.log(`NFTs for ${doc.wallet_address}:`);
             for (const nft of nfts) {
-              console.log(JSON.stringify(nft, null, 2));
-              
               // Match with nft_collections
               const matchingCollection = await nftCollections.findOne({
                 issuer: nft.Issuer,
@@ -76,28 +81,33 @@ async function fetchDataFromDB() {
               });
 
               if (matchingCollection) {
-                console.log("Matching collection found:");
-                console.log(JSON.stringify(matchingCollection, null, 2));
-                addressMatchingCollections++;
+                walletStats[doc.wallet_address].matchingCollections++;
                 totalMatchingCollections++;
-              } else {
-                console.log("No matching collection found for this NFT.");
               }
-              console.log("---");
             }
-          } else {
-            console.log(`No NFTs found for ${doc.wallet_address}`);
           }
-
-          console.log(`Total matching collections for ${doc.wallet_address}: ${addressMatchingCollections}`);
         }
       }
     } else {
       console.log("No documents found in the collection");
     }
 
-    console.log(`\nTotal NFT count across all addresses: ${totalNFTCount}`);
-    console.log(`Total matching collections across all addresses: ${totalMatchingCollections}`);
+    // Display all statistics at the end
+    console.log("\n--- Final Statistics ---");
+    console.log("\nPer Wallet Statistics:");
+    for (const [wallet, stats] of Object.entries(walletStats)) {
+      console.log(`\nWallet: ${wallet}`);
+      console.log(`  Tweet Submissions: ${stats.submissions}`);
+      console.log(`  NFT Count: ${stats.nftCount}`);
+      console.log(`  Matching Collections: ${stats.matchingCollections}`);
+    }
+
+    console.log("\nOverall Statistics:");
+    console.log(`Total Unique Wallets: ${Object.keys(walletStats).length}`);
+    console.log(`Total Tweet Submissions: ${Object.values(walletStats).reduce((sum, stats) => sum + stats.submissions, 0)}`);
+    console.log(`Total NFT Count: ${totalNFTCount}`);
+    console.log(`Total Matching Collections: ${totalMatchingCollections}`);
+
   } catch (error) {
     console.error("Error fetching data from the database:", error);
   } finally {
